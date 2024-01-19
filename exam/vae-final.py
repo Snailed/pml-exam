@@ -1,5 +1,6 @@
 from __future__ import print_function
 import os
+import os.path
 import torch
 from torch import nn, optim
 import torch.nn.functional as F
@@ -29,6 +30,8 @@ parser.add_argument('--recon', action=argparse.BooleanOptionalAction, default=Tr
                     help='Produce reconstructions (default: True)')
 parser.add_argument('--monte-carlo', action=argparse.BooleanOptionalAction, default=True,
                     help='Produce monte carlo estimation (default: True)')
+parser.add_argument('--importance-sampling', action=argparse.BooleanOptionalAction, default=True,
+                    help='Produce importance sampling estimation (default: True)')
 parser.add_argument('--scatter', action=argparse.BooleanOptionalAction, default=True,
                     help='Produce latent space scatter plot (default: True)')
 args = parser.parse_args()
@@ -83,6 +86,32 @@ class Bernoulli(VAE):
     def __init__(self):
         super().__init__()
 
+    def to_binary(self, x):
+        return (x >= 0.5).float()
+    def reconstruct(self, z):
+        return torch.distributions.Bernoulli(probs=self.decoder(z)).sample((1,))
+
+    # def training_step(self, batch, batch_idx):
+    #     # training_step defines the train loop. It is independent of forward
+    #     x, y = batch
+    #     x = x.view(x.size(0), -1)
+    #     x_enc = self.encoder(x)
+    #     mu, logvar = x_enc[:,:2], x_enc[:,2:4]
+    #     z = self.reparameterize(mu, logvar)
+    #     p = self.decoder(z)
+    #     loss = self.loss_function(p, x, mu, logvar)
+
+    #     self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+    #     return loss
+
+    def loss_function(self, recon_x, x, mu, logvar):
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        return KLD - torch.sum(torch.distributions.Bernoulli(probs=recon_x).log_prob(self.to_binary(x.view(-1, 784))))
+
+class BCE(VAE):
+    def __init__(self):
+        super().__init__()
+
     def reconstruct(self, z):
         return self.decoder(z)
 
@@ -95,7 +124,7 @@ class ContinuousBernoulli(VAE):
         super().__init__()
 
     def reconstruct(self, z):
-        return torch.distributions.ContinuousBernoulli(probs=self.decoder(z)).mean
+        return torch.distributions.ContinuousBernoulli(probs=self.decoder(z)).sample((1,))
 
     def loss_function(self, recon_x, x, mu, logvar):
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
@@ -222,15 +251,18 @@ def recon_grid():
     y_normal = torch.distributions.normal.Normal(0, 1).icdf(y_uniform)
     grid_x, grid_y = torch.meshgrid(x_normal, y_normal, indexing='ij')
     # Bernoulli
-    mean = model.decoder(torch.dstack([grid_y, grid_x]).reshape([-1,2]))
+    samples = torch.tensor([])
+    if args.model == 'bernoulli':
+        p = model.decoder(torch.dstack([grid_y, grid_x]).reshape([-1,2]))
+        samples = model.to_binary(torch.distributions.Bernoulli(p).sample((1,)))
     if args.model == 'continuous-bernoulli':
         lam = model.decoder(torch.dstack([grid_y, grid_x]).reshape([-1,2]))
-        mean = torch.distributions.ContinuousBernoulli(lam).mean
+        samples = torch.distributions.ContinuousBernoulli(lam).sample((1,))
     if args.model == 'beta-softplus' or args.model == 'beta-sigmoid':
         model_a = model.decoder_a(torch.dstack([grid_y, grid_x]).reshape([-1,2]))
         model_b = model.decoder_b(torch.dstack([grid_y, grid_x]).reshape([-1,2]))
-        mean = torch.distributions.Beta(model_a, model_b).mean
-    grid = make_grid(mean.view(20 * 20, 1, 28, 28), nrow=20)
+        samples = torch.distributions.Beta(model_a, model_b).sample((1,))
+    grid = make_grid(samples.view(20 * 20, 1, 28, 28), nrow=20)
     show_grid(grid, x_normal.numpy(), y_normal.numpy())
     plt.title(args.model.capitalize())
     plt.savefig(f'lightning_logs/version_{trainer.logger.version}/recon')
@@ -267,7 +299,7 @@ def monte_carlo_sampling(test_set, n_samples=100):
             if args.model == 'continuous-bernoulli':
                 probs.append(torch.sum(torch.distributions.ContinuousBernoulli(lam[i]).log_prob(x.view(-1, 784)), dim=1))
             if args.model == 'bernoulli': # Cannot use bernoulli since x needs to be in {0,1}
-                probs.append(torch.sum(torch.distributions.ContinuousBernoulli(recon[i]).log_prob(x.view(-1, 784)), dim=1))
+                probs.append(torch.sum(torch.distributions.Bernoulli(recon[i]).log_prob(model.to_binary(x.view(-1, 784))), dim=1))
             means.append(np.mean(np.array(probs)))
             vars.append(np.var(np.array(probs)))
         print(f"Final mean {means[-1]}")
@@ -285,6 +317,83 @@ def monte_carlo_sampling(test_set, n_samples=100):
         plt.savefig(f'lightning_logs/version_{trainer.logger.version}/means')
         plt.clf()
 
+def importance_sampling(test, n_samples=200):
+    for x, y in DataLoader(test, batch_size=5000):
+        # x_enc = model.encoder(x[:n_samples].view(-1, 784))
+        # mus, logvars = x_enc[:,:2], x_enc[:, 2:4]
+        # samples = model.reparameterize(mus, logvars)
+        # importance_weights = (torch.distributions.Normal(mus, (0.5 * logvars).exp()).log_prob(samples) - torch.distributions.Normal(0,1).log_prob(samples)).sum(dim=1).exp()
+        # a, b, lam, recon = ([], [], [], [])
+        # if args.model == 'beta-sigmoid' or args.model == 'beta-softplus':
+        #     a = model.decoder_a(samples)
+        #     b = model.decoder_b(samples)
+        # if args.model == 'continuous-bernoulli':
+        #     lam = model.decoder(samples)
+        # else:
+        #     recon = model.decoder(samples)
+        # probs = []
+        # means = []
+        # vars = []
+        # for i in trange(5000):
+        #     print(importance_weights[:i+1])
+        #     if args.model == 'beta-sigmoid' or args.model == 'beta-softplus':
+        #         probs.append(importance_weights[:i+1] * torch.sum(torch.distributions.Beta(a[i], b[i]).log_prob(torch.clamp(x.view(-1, 784)[:i+1], min=1e-7, max=1-1e-7)), dim=1))
+        #     if args.model == 'continuous-bernoulli':
+        #         probs.append(importance_weights[:i+1] * torch.sum(torch.distributions.ContinuousBernoulli(lam[i]).log_prob(x.view(-1, 784)[:i+1]), dim=1))
+        #     if args.model == 'bernoulli':
+        #         probs.append(importance_weights[:i+1] * torch.sum(torch.distributions.Bernoulli(recon[i]).log_prob(model.to_binary(x.view(-1, 784)[:i+1])), dim=1))
+        #     means.append(np.mean(np.array(probs)))
+        #     vars.append(np.var(np.array(probs)))
+        # print(f"Final mean {means[-1]}")
+        # print(f"Final variance {vars[-1]}")
+        n_images = 1000
+        # log_p = lambda *args: 0
+        # if args.model == 'bernoulli':
+        #     log_p = lambda x, par: torch.distributions.Bernoulli(par).log_prob(model.to_binary(x))
+        # if args.model == 'continuous-bernoulli':
+        #     log_p = lambda x, par: torch.distributions.ContinuousBernoulli(par).log_prob(model.to_binary(x))
+        # if args.model == 'beta-sigmoid' or args.model == 'beta-softplus':
+        #     log_p = lambda x, par1, par2: torch.distributions.Beta(par1, par2).log_prob(model.to_binary(x))
+        means = []
+        for n in trange(50):
+            x = x[:n_images] # just consider one image for now
+            n_samples = n * 20 + 1
+            z_enc = model.encoder(x.view(-1,784))
+            mu, logvar = z_enc[:, :2], z_enc[:, 2:4]
+            z = torch.distributions.Normal(mu,(0.5*logvar).exp()).sample((n_samples,))
+            log_p_part = 0
+            if args.model == 'bernoulli' or args.model == 'continuous-bernoulli':
+                if args.model == 'bernoulli':
+                    log_p = lambda x, par: torch.distributions.Bernoulli(par).log_prob(model.to_binary(x))
+                if args.model == 'continuous-bernoulli':
+                    log_p = lambda x, par: torch.distributions.ContinuousBernoulli(par).log_prob(x)
+                z_dec = model.decoder(z)
+                log_p_part  = log_p(x.view(-1,784), z_dec.view(n_samples, n_images, 784))
+            if args.model == 'beta-sigmoid' or args.model == 'beta-softplus':
+                log_p = lambda x, par1, par2: torch.distributions.Beta(par1, par2).log_prob(torch.clamp(x, min=1e-5, max=1-1e-5))
+                z_dec1 = model.decoder_a(z)
+                z_dec2 = model.decoder_b(z)
+                # print(z_dec1)
+                log_p_part  = log_p(x.view(-1,784), z_dec1.view(n_samples, n_images, 784), z_dec2.view(n_samples, n_images, 784))
+                # print(log_p_part)
+            importance_weights = (torch.sum(torch.distributions.Normal(0,1).log_prob(z), dim=2)) - torch.sum(torch.distributions.Normal(mu,(0.5*logvar).exp()).log_prob(z), dim=2)
+            #print(torch.mean(torch.mean(importance_weights.exp() * torch.sum(log_p(x.view(-1,784), z_dec.view(n_samples, n_images, 784)), dim=2), dim=0), dim=0))
+            means.append(torch.mean(torch.mean(importance_weights.exp() * torch.sum(log_p_part, dim=2), dim=0), dim=0))
+            
+        #print(torch.sum(torch.sum(log_p(x.view(-1,784), z_dec), dim=1)))
+        # plt.plot(vars)
+        # plt.title(f'Estimator variance ({args.model.capitalize()})')
+        # plt.ylabel('$Var[\\log p(x|z)]$')
+        # plt.xlabel('n_samples of $z$')
+        # plt.savefig(f'lightning_logs/version_{trainer.logger.version}/vars')
+        # plt.clf()
+        print(means[-1])
+        plt.plot(np.linspace(0,50*20, 50), means)
+        plt.xlabel('n_samples of $z$')
+        plt.ylabel('$E[\\log p(x|z)]$')
+        plt.title(f'Estimator mean ({args.model.capitalize()})')
+        plt.savefig(f'means-{trainer.logger.version}-{args.model}')
+        plt.clf()
 
 if __name__ == "__main__":
     with torch.no_grad():
@@ -292,5 +401,7 @@ if __name__ == "__main__":
             recon_grid()
         if args.monte_carlo:
             monte_carlo_sampling(test, n_samples=200)
+        if args.importance_sampling:
+            importance_sampling(test, n_samples=200)
         if args.scatter:
             scatter_latent()
